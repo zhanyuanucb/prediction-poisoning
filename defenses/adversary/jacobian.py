@@ -2,6 +2,10 @@
 """This is a short description.
 Replace this with a more detailed description of what this file contains.
 """
+import sys
+sys.path.append('/mydata/model-extraction/prediction-poisoning/knockoffnets/')
+sys.path.append('/mydata/model-extraction/prediction-poisoning/')
+
 import argparse
 import os.path as osp
 import os
@@ -9,6 +13,7 @@ import pickle
 import json
 from datetime import datetime
 import re
+from PIL import Image
 
 import numpy as np
 
@@ -40,6 +45,35 @@ __status__ = "Development"
 def make_one_hot(labels, K):
     return torch.zeros(labels.shape[0], K, device=labels.device).scatter(1, labels.unsqueeze(1), 1)
 
+class ImageTensorSet(Dataset):
+    """
+    Data are saved as:
+    List[data:torch.Tensor(), labels:torch.Tensor()]
+    """
+    def __init__(self, samples, transform=None, dataset="cifar"):
+        self.data, self.targets = samples
+        self.transform = transform
+        self.mode = "RGB" if dataset != "mnist" else "L"
+
+    def __getitem__(self, index):
+        img, target = self.data[index], self.targets[index]
+        if self.transform is not None:
+            img *= 255
+            img = img.numpy().astype('uint8')
+            if self.mode == "RGB":
+                img = img.transpose([1, 2, 0])
+            img = Image.fromarray(img, mode=self.mode)
+            img = self.transform(img)
+
+        return img, target
+
+    def __len__(self):
+        return len(self.data)
+
+
+DATA_STAT = {"mnist":{'mean':(0.1307,), 'std':(0.3081,)},
+           "cifar":{'mean':(0.4914, 0.4822, 0.4465),
+                    'std':(0.2023, 0.1994, 0.2010)}}
 
 class JacobianAdversary:
     """
@@ -49,7 +83,7 @@ class JacobianAdversary:
     """
     def __init__(self, blackbox, budget, model_adv_name, model_adv_pretrained, modelfamily, seedset, testset, device,
                  out_dir, batch_size=cfg.DEFAULT_BATCH_SIZE, train_epochs=20, kappa=400, tau=None, rho=6, sigma=-1,
-                 query_batch_size=1, aug_strategy='jbda', useprobs=True, final_train_epochs=100):
+                 query_batch_size=1, random_adv=False, adv_transform=False, aug_strategy='jbda', useprobs=True, final_train_epochs=100):
         self.blackbox = blackbox
         self.budget = budget
         self.model_adv_name = model_adv_name
@@ -68,8 +102,15 @@ class JacobianAdversary:
         self.rho = rho
         self.sigma = sigma
         self.device = device
+        self.MEAN = torch.Tensor(DATA_STAT[modelfamily]["mean"])
+        self.STD = torch.Tensor(DATA_STAT[modelfamily]["std"])
+        self.adv_transform = adv_transform
+        if modelfamily != "mnist":
+            self.MEAN = self.MEAN.reshape([1, 3, 1, 1])
+            self.STD = self.STD.reshape([1, 3, 1, 1])
         self.out_dir = out_dir
         self.num_classes = len(self.testset.classes)
+        self.random_adv = random_adv
         assert (aug_strategy in ['jbda', 'jbself']) or 'jbtop' in aug_strategy
         self.aug_strategy = aug_strategy
         self.topk = 0
@@ -113,6 +154,8 @@ class JacobianAdversary:
                                             lr_gamma=0.1, testset=self.testset,
                                             criterion_train=model_utils.soft_cross_entropy)
 
+    def denormalize(self, images):
+        return torch.clamp(images*self.STD + self.MEAN, 0., 1.)   
 
     def get_transferset(self):
         """
@@ -120,50 +163,86 @@ class JacobianAdversary:
         """
         # for rho_current in range(self.rho):
         rho_current = 0
-        while self.blackbox.call_count < self.budget:
-            print('=> Beginning substitute epoch {} (|D| = {})'.format(rho_current, len(self.D)))
-            # -------------------------- 0. Initialize Model
+        if not self.random_adv:
+            while self.blackbox.call_count < self.budget:
+                print('=> Beginning substitute epoch {} (|D| = {})'.format(rho_current, len(self.D)))
+                # -------------------------- 0. Initialize Model
+                model_adv = zoo.get_net(self.model_adv_name, self.modelfamily, self.model_adv_pretrained,
+                                        num_classes=self.num_classes)
+                model_adv = model_adv.to(self.device)
+
+                # -------------------------- 1. Train model on D
+                model_adv = model_utils.train_model(model_adv, self.D, self.out_dir, num_workers=10,
+                                                    checkpoint_suffix='.{}'.format(self.blackbox.call_count),
+                                                    device=self.device, epochs=self.train_epochs, log_interval=500, lr=0.1,
+                                                    momentum=0.9, batch_size=self.batch_size, lr_gamma=0.1,
+                                                    testset=self.testset, criterion_train=model_utils.soft_cross_entropy)
+
+                # -------------------------- 2. Evaluate model
+                # _, acc = model_utils.test_step(model_adv, self.testloader, nn.CrossEntropyLoss(reduction='mean'),
+                #                                device=self.device, epoch=rho_current)
+                # self.accuracies.append(acc)
+
+                # -------------------------- 3. Jacobian-based data augmentation
+                if self.aug_strategy in ['jbda', 'jbself']:
+                    self.D = self.jacobian_augmentation(model_adv, rho_current)
+                elif self.aug_strategy == 'jbtop{}'.format(self.topk):
+                    self.D = self.jacobian_augmentation_topk(model_adv, rho_current)
+                else:
+                    raise ValueError('Unrecognized augmentation strategy: "{}"'.format(self.aug_strategy))
+
+                # -------------------------- 4. End if necessary
+                rho_current += 1
+                if (self.blackbox.call_count >= self.budget) or ((self.rho is not None) and (rho_current >= self.rho)):
+                    print('=> # BB Queries ({}) >= budget ({}). Ending attack.'.format(self.blackbox.call_count,
+                                                                                       self.budget))
+                    model_adv = zoo.get_net(self.model_adv_name, self.modelfamily, self.model_adv_pretrained,
+                                            num_classes=self.num_classes)
+                    model_adv = model_adv.to(self.device)
+
+                    ################################################
+                    # Enable data augmentation
+                    ################################################
+                    Dx, Dy = self.D.tensors                                      
+                    transform = datasets.modelfamily_to_transforms[self.modelfamily]["train"]
+                    transform = None
+                    if self.adv_transform:
+                        Dx = self.denormalize(Dx)
+                        transform = datasets.modelfamily_to_transforms[self.modelfamily]["train"]
+                    self.D = ImageTensorSet((Dx, Dy), transform=transform)
+
+                    model_adv = model_utils.train_model(model_adv, self.D, self.out_dir, num_workers=10,
+                                                        checkpoint_suffix='.{}'.format(self.blackbox.call_count),
+                                                        device=self.device, epochs=self.final_train_epochs,
+                                                        log_interval=500, lr=0.01, momentum=0.9, batch_size=self.batch_size,
+                                                        lr_gamma=0.1, testset=self.testset,
+                                                        criterion_train=model_utils.soft_cross_entropy)
+                    break
+
+                print()
+        else:
+            print('=> # BB Queries ({}) >= budget ({}). Ending attack.'.format(self.blackbox.call_count,
+                                                                               self.budget))
             model_adv = zoo.get_net(self.model_adv_name, self.modelfamily, self.model_adv_pretrained,
                                     num_classes=self.num_classes)
             model_adv = model_adv.to(self.device)
 
-            # -------------------------- 1. Train model on D
+            ################################################
+            # Enable data augmentation
+            ################################################
+            Dx, Dy = self.D.tensors                                      
+            transform = None
+            if self.adv_transform:
+                Dx = self.denormalize(Dx)
+                transform = datasets.modelfamily_to_transforms[self.modelfamily]["train"]
+            self.D = ImageTensorSet((Dx, Dy), transform=transform)
+
             model_adv = model_utils.train_model(model_adv, self.D, self.out_dir, num_workers=10,
                                                 checkpoint_suffix='.{}'.format(self.blackbox.call_count),
-                                                device=self.device, epochs=self.train_epochs, log_interval=500, lr=0.1,
-                                                momentum=0.9, batch_size=self.batch_size, lr_gamma=0.1,
-                                                testset=self.testset, criterion_train=model_utils.soft_cross_entropy)
-
-            # -------------------------- 2. Evaluate model
-            # _, acc = model_utils.test_step(model_adv, self.testloader, nn.CrossEntropyLoss(reduction='mean'),
-            #                                device=self.device, epoch=rho_current)
-            # self.accuracies.append(acc)
-
-            # -------------------------- 3. Jacobian-based data augmentation
-            if self.aug_strategy in ['jbda', 'jbself']:
-                self.D = self.jacobian_augmentation(model_adv, rho_current)
-            elif self.aug_strategy == 'jbtop{}'.format(self.topk):
-                self.D = self.jacobian_augmentation_topk(model_adv, rho_current)
-            else:
-                raise ValueError('Unrecognized augmentation strategy: "{}"'.format(self.aug_strategy))
-
-            # -------------------------- 4. End if necessary
-            rho_current += 1
-            if (self.blackbox.call_count >= self.budget) or ((self.rho is not None) and (rho_current >= self.rho)):
-                print('=> # BB Queries ({}) >= budget ({}). Ending attack.'.format(self.blackbox.call_count,
-                                                                                   self.budget))
-                model_adv = zoo.get_net(self.model_adv_name, self.modelfamily, self.model_adv_pretrained,
-                                        num_classes=self.num_classes)
-                model_adv = model_adv.to(self.device)
-                model_adv = model_utils.train_model(model_adv, self.D, self.out_dir, num_workers=10,
-                                                    checkpoint_suffix='.{}'.format(self.blackbox.call_count),
-                                                    device=self.device, epochs=self.final_train_epochs,
-                                                    log_interval=500, lr=0.01, momentum=0.9, batch_size=self.batch_size,
-                                                    lr_gamma=0.1, testset=self.testset,
-                                                    criterion_train=model_utils.soft_cross_entropy)
-                break
-
-            print()
+                                                device=self.device, epochs=self.final_train_epochs,
+                                                log_interval=500, lr=0.01, momentum=0.9, batch_size=self.batch_size,
+                                                lr_gamma=0.1, testset=self.testset,
+                                                criterion_train=model_utils.soft_cross_entropy)
 
         return self.D, model_adv
 
@@ -366,6 +445,8 @@ def main():
     parser.add_argument('-d', '--device_id', metavar='D', type=int, help='Device id', default=0)
     parser.add_argument('-w', '--nworkers', metavar='N', type=int, help='# Worker threads to load data', default=10)
     parser.add_argument('--train_transform', action='store_true', help='Perform data augmentation', default=False)
+    parser.add_argument('--random_adv', action='store_true', help='Perform data augmentation', default=False)
+    parser.add_argument('--adv_transform', action='store_true', help='Perform data augmentation', default=False)
     args = parser.parse_args()
     params = vars(args)
 
@@ -429,8 +510,14 @@ def main():
         raise ValueError('Unrecognized blackbox type')
     defense_kwargs = parse_defense_kwargs(params['defense_args'])
     defense_kwargs['log_prefix'] = 'transfer'
+    defense_kwargs["out_path"] = out_path
     print('=> Initializing BBox with defense {} and arguments: {}'.format(defense_type, defense_kwargs))
     blackbox = BB.from_modeldir(blackbox_dir, device, **defense_kwargs)
+    # ---------- Evaluate blackbox
+    _, acc = model_utils.test_step(blackbox, DataLoader(testset, batch_size=params["batch_size"], shuffle=True, num_workers=10), nn.CrossEntropyLoss(reduction='mean'),
+                                            device=device)
+
+    print(f"Blackbox evaluation accuracy: {acc}")
 
     for k, v in defense_kwargs.items():
         params[k] = v
@@ -446,10 +533,12 @@ def main():
     rho = params['rho']
     sigma = params['sigma']
     policy = params['policy']
+    random_adv = True if params['random_adv'] else False
+    adv_transform = True if params['adv_transform'] else False
     adversary = JacobianAdversary(blackbox, budget, model_adv_name, model_adv_pretrained, modelfamily, seedset,
                                   testset, device, out_path, batch_size=batch_size,
                                   train_epochs=train_epochs, kappa=kappa, tau=tau, rho=rho,
-                                  sigma=sigma, aug_strategy=policy)
+                                  sigma=sigma, random_adv=random_adv, adv_transform=adv_transform, aug_strategy=policy)
 
     print('=> constructing transfer set...')
     transferset, model_adv = adversary.get_transferset()
